@@ -1,4 +1,4 @@
-package sqlite3
+package sqshared
 
 import (
 	"bufio"
@@ -21,7 +21,7 @@ import (
 
 var (
 	db     *sql.DB
-	reader *metaReader
+	reader *MetadataReader
 )
 
 func TestMain(m *testing.M) {
@@ -33,7 +33,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatalf("Could not open the database: %s", err)
 	}
-	reader = &metaReader{LoggingReader: metadata.NewLoggingReader(db)}
+	reader = &MetadataReader{LoggingReader: metadata.NewLoggingReader(db)}
 
 	code := m.Run()
 	os.Exit(code)
@@ -51,7 +51,7 @@ func createDb(location, name string) error {
 		return err
 	}
 	baseImage := "centos:7"
-	schemaURL := "https://raw.githubusercontent.com/jOOQ/jOOQ/main/jOOQ-examples/Sakila/sqlite-sakila-db/sqlite-sakila-schema.sql"
+	schemaURL := "https://raw.githubusercontent.com/jOOQ/sakila/main/sqlite-sakila-db/sqlite-sakila-schema.sql"
 	target := "/schema"
 	buildOptions := types.ImageBuildOptions{
 		Tags: []string{"usql-sqlite"},

@@ -1,5 +1,5 @@
 // Package drivers handles the registration, default implementation, and
-// handles hooks for registered usql database drivers.
+// handles hooks for usql database drivers.
 package drivers
 
 import (
@@ -10,6 +10,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/alecthomas/chroma"
 	"github.com/alecthomas/chroma/lexers"
@@ -54,10 +55,15 @@ type Driver struct {
 	RequirePreviousPassword bool
 	// LexerName is the name of the syntax lexer to use.
 	LexerName string
+	// LowerColumnNames will cause column names to be lowered cased.
+	LowerColumnNames bool
+	// UseColumnTypes will cause database's ColumnTypes func to be used for
+	// types.
+	UseColumnTypes bool
 	// ForceParams will be used to force parameters if defined.
 	ForceParams func(*dburl.URL)
 	// Open will be used by Open if defined.
-	Open func(*dburl.URL) (func(string, string) (*sql.DB, error), error)
+	Open func(*dburl.URL, func() io.Writer, func() io.Writer) (func(string, string) (*sql.DB, error), error)
 	// Version will be used by Version if defined.
 	Version func(context.Context, DB) (string, error)
 	// User will be used by User if defined.
@@ -68,9 +74,6 @@ type Driver struct {
 	IsPasswordErr func(error) bool
 	// Process will be used by Process if defined.
 	Process func(string, string) (string, string, bool, error)
-	// Columns will be used to retrieve the columns for the rows if
-	// defined.
-	Columns func(*sql.Rows) ([]string, error)
 	// RowsAffected will be used by RowsAffected if defined.
 	RowsAffected func(sql.Result) (int64, error)
 	// Err will be used by Error.Error if defined.
@@ -98,14 +101,12 @@ type Driver struct {
 	NewMetadataWriter func(db DB, w io.Writer, opts ...metadata.ReaderOption) metadata.Writer
 	// NewCompleter returns a db auto-completer.
 	NewCompleter func(db DB, opts ...completer.Option) readline.AutoCompleter
+	// Copy rows into the database table
+	Copy func(ctx context.Context, db *sql.DB, rows *sql.Rows, table string) (int64, error)
 }
 
-// drivers is the map of drivers funcs.
-var drivers map[string]Driver
-
-func init() {
-	drivers = make(map[string]Driver)
-}
+// drivers are registered drivers.
+var drivers = make(map[string]Driver)
 
 // Available returns the available drivers.
 func Available() map[string]Driver {
@@ -126,13 +127,30 @@ func Register(name string, d Driver, aliases ...string) {
 	}
 }
 
-// Registered returns whether or not a specific driver has been registered.
+// Registered returns whether or not a driver is registered.
 func Registered(name string) bool {
 	_, ok := drivers[name]
 	return ok
 }
 
-// ForceParams forces parameters on the supplied DSN for the registered driver.
+// LowerColumnNames returns whether or not column names should be converted to
+// lower case for a driver.
+func LowerColumnNames(u *dburl.URL) bool {
+	if d, ok := drivers[u.Driver]; ok {
+		return d.LowerColumnNames
+	}
+	return false
+}
+
+// UseColumnTypes returns whether or not a driver should uses column types.
+func UseColumnTypes(u *dburl.URL) bool {
+	if d, ok := drivers[u.Driver]; ok {
+		return d.UseColumnTypes
+	}
+	return false
+}
+
+// ForceParams forces parameters on the DSN for a driver.
 func ForceParams(u *dburl.URL) {
 	d, ok := drivers[u.Driver]
 	if ok && d.ForceParams != nil {
@@ -140,8 +158,8 @@ func ForceParams(u *dburl.URL) {
 	}
 }
 
-// Open opens a sql.DB connection for the registered driver.
-func Open(u *dburl.URL) (*sql.DB, error) {
+// Open opens a sql.DB connection for a driver.
+func Open(u *dburl.URL, stdout, stderr func() io.Writer) (*sql.DB, error) {
 	d, ok := drivers[u.Driver]
 	if !ok {
 		return nil, WrapErr(u.Driver, text.ErrDriverNotAvailable)
@@ -149,7 +167,7 @@ func Open(u *dburl.URL) (*sql.DB, error) {
 	f := sql.Open
 	if d.Open != nil {
 		var err error
-		if f, err = d.Open(u); err != nil {
+		if f, err = d.Open(u, stdout, stderr); err != nil {
 			return nil, WrapErr(u.Driver, err)
 		}
 	}
@@ -160,7 +178,7 @@ func Open(u *dburl.URL) (*sql.DB, error) {
 	return db, nil
 }
 
-// stmtOpts returns statement options for the specified driver.
+// stmtOpts returns statement options for a driver.
 func stmtOpts(u *dburl.URL) []stmt.Option {
 	if u != nil {
 		if d, ok := drivers[u.Driver]; ok {
@@ -180,12 +198,12 @@ func stmtOpts(u *dburl.URL) []stmt.Option {
 	}
 }
 
-// NewStmt wraps creating a new stmt.Stmt for the specified driver.
+// NewStmt wraps creating a new stmt.Stmt for a driver.
 func NewStmt(u *dburl.URL, f func() ([]rune, error), opts ...stmt.Option) *stmt.Stmt {
 	return stmt.New(f, append(opts, stmtOpts(u)...)...)
 }
 
-// ConfigStmt sets the stmt.Stmt options for the specified driver.
+// ConfigStmt sets the stmt.Stmt options for a driver.
 func ConfigStmt(u *dburl.URL, s *stmt.Stmt) {
 	if u == nil {
 		return
@@ -195,8 +213,7 @@ func ConfigStmt(u *dburl.URL, s *stmt.Stmt) {
 	}
 }
 
-// Version returns information about the database connection for the specified
-// URL's driver.
+// Version returns information about the database connection for a driver.
 func Version(ctx context.Context, u *dburl.URL, db DB) (string, error) {
 	if d, ok := drivers[u.Driver]; ok && d.Version != nil {
 		ver, err := d.Version(ctx, db)
@@ -210,7 +227,7 @@ func Version(ctx context.Context, u *dburl.URL, db DB) (string, error) {
 	return ver, nil
 }
 
-// User returns the current database user for the specified URL's driver.
+// User returns the current database user for a driver.
 func User(ctx context.Context, u *dburl.URL, db DB) (string, error) {
 	if d, ok := drivers[u.Driver]; ok && d.User != nil {
 		user, err := d.User(ctx, db)
@@ -221,7 +238,7 @@ func User(ctx context.Context, u *dburl.URL, db DB) (string, error) {
 	return user, nil
 }
 
-// Process processes the supplied SQL query for the specified URL's driver.
+// Process processes the sql query for a driver.
 func Process(u *dburl.URL, prefix, sqlstr string) (string, string, bool, error) {
 	if d, ok := drivers[u.Driver]; ok && d.Process != nil {
 		a, b, c, err := d.Process(prefix, sqlstr)
@@ -231,8 +248,7 @@ func Process(u *dburl.URL, prefix, sqlstr string) (string, string, bool, error) 
 	return typ, sqlstr, q, nil
 }
 
-// IsPasswordErr returns true if the specified err is a password error for the
-// specified URL's driver.
+// IsPasswordErr returns true if an err is a password error for a driver.
 func IsPasswordErr(u *dburl.URL, err error) bool {
 	drv := u.Driver
 	if e, ok := err.(*Error); ok {
@@ -244,8 +260,8 @@ func IsPasswordErr(u *dburl.URL, err error) bool {
 	return false
 }
 
-// RequirePreviousPassword returns true if the specified URL's driver requires
-// a previous password when changing a user's password.
+// RequirePreviousPassword returns true if a driver requires a previous
+// password when changing a user's password.
 func RequirePreviousPassword(u *dburl.URL) bool {
 	if d, ok := drivers[u.Driver]; ok {
 		return d.RequirePreviousPassword
@@ -253,8 +269,8 @@ func RequirePreviousPassword(u *dburl.URL) bool {
 	return false
 }
 
-// CanChangePassword returns whether or not the specified driver's URL supports
-// changing passwords.
+// CanChangePassword returns whether or not the a driver supports changing
+// passwords.
 func CanChangePassword(u *dburl.URL) error {
 	if d, ok := drivers[u.Driver]; ok && d.ChangePassword != nil {
 		return nil
@@ -262,9 +278,8 @@ func CanChangePassword(u *dburl.URL) error {
 	return text.ErrPasswordNotSupportedByDriver
 }
 
-// ChangePassword initiates a user password change for the specified URL's
-// driver. If user is not supplied, then the current user will be retrieved
-// from User.
+// ChangePassword initiates a user password change for the a driver. If user is
+// not supplied, then the current user will be retrieved from User.
 func ChangePassword(u *dburl.URL, db DB, user, new, old string) (string, error) {
 	if d, ok := drivers[u.Driver]; ok && d.ChangePassword != nil {
 		if user == "" {
@@ -278,18 +293,20 @@ func ChangePassword(u *dburl.URL, db DB, user, new, old string) (string, error) 
 	return "", text.ErrPasswordNotSupportedByDriver
 }
 
-// Columns returns the column names for the SQL row result for the specified
-// URL's driver.
+// Columns returns the column names for the SQL row result for a driver.
 func Columns(u *dburl.URL, rows *sql.Rows) ([]string, error) {
-	var cols []string
-	var err error
-	if d, ok := drivers[u.Driver]; ok && d.Columns != nil {
-		cols, err = d.Columns(rows)
-	} else {
-		cols, err = rows.Columns()
-	}
+	cols, err := rows.Columns()
 	if err != nil {
 		return nil, WrapErr(u.Driver, err)
+	}
+	if drivers[u.Driver].LowerColumnNames {
+		for i, s := range cols {
+			if j := strings.IndexFunc(s, func(r rune) bool {
+				return unicode.IsLetter(r) && unicode.IsLower(r)
+			}); j == -1 {
+				cols[i] = strings.ToLower(s)
+			}
+		}
 	}
 	for i, c := range cols {
 		if strings.TrimSpace(c) == "" {
@@ -299,8 +316,7 @@ func Columns(u *dburl.URL, rows *sql.Rows) ([]string, error) {
 	return cols, nil
 }
 
-// ConvertBytes returns a func to handle converting bytes for the specified
-// URL's driver.
+// ConvertBytes returns a func to handle converting bytes for a driver.
 func ConvertBytes(u *dburl.URL) func([]byte, string) (string, error) {
 	if d, ok := drivers[u.Driver]; ok && d.ConvertBytes != nil {
 		return d.ConvertBytes
@@ -311,7 +327,7 @@ func ConvertBytes(u *dburl.URL) func([]byte, string) (string, error) {
 }
 
 // ConvertMap returns a func to handle converting a map[string]interface{} for
-// the specified URL's driver.
+// a driver.
 func ConvertMap(u *dburl.URL) func(map[string]interface{}) (string, error) {
 	if d, ok := drivers[u.Driver]; ok && d.ConvertMap != nil {
 		return d.ConvertMap
@@ -325,8 +341,8 @@ func ConvertMap(u *dburl.URL) func(map[string]interface{}) (string, error) {
 	}
 }
 
-// ConvertSlice returns a func to handle converting a []interface{} for
-// the specified URL's driver.
+// ConvertSlice returns a func to handle converting a []interface{} for a
+// driver.
 func ConvertSlice(u *dburl.URL) func([]interface{}) (string, error) {
 	if d, ok := drivers[u.Driver]; ok && d.ConvertSlice != nil {
 		return d.ConvertSlice
@@ -340,8 +356,8 @@ func ConvertSlice(u *dburl.URL) func([]interface{}) (string, error) {
 	}
 }
 
-// ConvertDefault returns a func to handle converting a interface{} for
-// the specified URL's driver.
+// ConvertDefault returns a func to handle converting a interface{} for a
+// driver.
 func ConvertDefault(u *dburl.URL) func(interface{}) (string, error) {
 	if d, ok := drivers[u.Driver]; ok && d.ConvertDefault != nil {
 		return d.ConvertDefault
@@ -351,8 +367,8 @@ func ConvertDefault(u *dburl.URL) func(interface{}) (string, error) {
 	}
 }
 
-// BatchAsTransaction returns whether or not the the specified URL's driver requires
-// batched queries to be done within a transaction block.
+// BatchAsTransaction returns whether or not a driver requires batched queries
+// to be done within a transaction block.
 func BatchAsTransaction(u *dburl.URL) bool {
 	if d, ok := drivers[u.Driver]; ok {
 		return d.BatchAsTransaction
@@ -374,8 +390,7 @@ func IsBatchQueryPrefix(u *dburl.URL, prefix string) (string, string, bool) {
 	return typ, end, ok
 }
 
-// RowsAffected returns the rows affected for the SQL result for a specified
-// URL's driver.
+// RowsAffected returns the rows affected for the SQL result for a driver.
 func RowsAffected(u *dburl.URL, res sql.Result) (int64, error) {
 	var count int64
 	var err error
@@ -393,12 +408,12 @@ func RowsAffected(u *dburl.URL, res sql.Result) (int64, error) {
 	return count, nil
 }
 
-// Ping pings the database for a specified URL's driver.
+// Ping pings the database for a driver.
 func Ping(ctx context.Context, u *dburl.URL, db *sql.DB) error {
 	return WrapErr(u.Driver, db.PingContext(ctx))
 }
 
-// Lexer returns the syntax lexer for a specified URL's driver.
+// Lexer returns the syntax lexer for a driver.
 func Lexer(u *dburl.URL) chroma.Lexer {
 	var l chroma.Lexer
 	if u != nil {
@@ -430,14 +445,8 @@ func ForceQueryParameters(params []string) func(*dburl.URL) {
 	}
 }
 
-// NextResultSet is a wrapper around the go1.8 introduced
-// sql.Rows.NextResultSet call.
-func NextResultSet(q *sql.Rows) bool {
-	return q.NextResultSet()
-}
-
-// NewMetadataReader wraps creating a new database introspector for the specified driver.
-func NewMetadataReader(u *dburl.URL, db DB, w io.Writer, opts ...metadata.ReaderOption) (metadata.Reader, error) {
+// NewMetadataReader wraps creating a new database introspector for a driver.
+func NewMetadataReader(ctx context.Context, u *dburl.URL, db DB, w io.Writer, opts ...metadata.ReaderOption) (metadata.Reader, error) {
 	d, ok := drivers[u.Driver]
 	if !ok || d.NewMetadataReader == nil {
 		return nil, fmt.Errorf(text.NotSupportedByDriver, `describe commands`)
@@ -445,8 +454,8 @@ func NewMetadataReader(u *dburl.URL, db DB, w io.Writer, opts ...metadata.Reader
 	return d.NewMetadataReader(db, opts...), nil
 }
 
-// NewMetadataWriter wraps creating a new database metadata printer for the specified driver.
-func NewMetadataWriter(u *dburl.URL, db DB, w io.Writer, opts ...metadata.ReaderOption) (metadata.Writer, error) {
+// NewMetadataWriter wraps creating a new database metadata printer for a driver.
+func NewMetadataWriter(ctx context.Context, u *dburl.URL, db DB, w io.Writer, opts ...metadata.ReaderOption) (metadata.Writer, error) {
 	d, ok := drivers[u.Driver]
 	if !ok {
 		return nil, fmt.Errorf(text.NotSupportedByDriver, `describe commands`)
@@ -461,7 +470,9 @@ func NewMetadataWriter(u *dburl.URL, db DB, w io.Writer, opts ...metadata.Reader
 	return newMetadataWriter(db, w), nil
 }
 
-func NewCompleter(u *dburl.URL, db DB, opts ...completer.Option) readline.AutoCompleter {
+// NewCompleter creates a metadata completer for a driver and database
+// connection.
+func NewCompleter(ctx context.Context, u *dburl.URL, db DB, readerOpts []metadata.ReaderOption, opts ...completer.Option) readline.AutoCompleter {
 	d, ok := drivers[u.Driver]
 	if !ok {
 		return nil
@@ -472,15 +483,108 @@ func NewCompleter(u *dburl.URL, db DB, opts ...completer.Option) readline.AutoCo
 	if d.NewMetadataReader == nil {
 		return nil
 	}
-	r := d.NewMetadataReader(db,
+	// prepend to allow to override default options
+	readerOpts = append([]metadata.ReaderOption{
 		// this needs to be relatively low, since autocomplete is very interactive
-		metadata.WithTimeout(3*time.Second),
+		metadata.WithTimeout(3 * time.Second),
 		metadata.WithLimit(1000),
-	)
-	// prepend to allow to override both reader and db
+	}, readerOpts...)
 	opts = append([]completer.Option{
-		completer.WithReader(r),
+		completer.WithReader(d.NewMetadataReader(db, readerOpts...)),
 		completer.WithDB(db),
 	}, opts...)
 	return completer.NewDefaultCompleter(opts...)
+}
+
+// Copy copies the result set to the destination sql.DB.
+func Copy(ctx context.Context, u *dburl.URL, stdout, stderr func() io.Writer, rows *sql.Rows, table string) (int64, error) {
+	d, ok := drivers[u.Driver]
+	if !ok {
+		return 0, WrapErr(u.Driver, text.ErrDriverNotAvailable)
+	}
+	if d.Copy == nil {
+		return 0, fmt.Errorf(text.NotSupportedByDriver, "copy")
+	}
+	db, err := Open(u, stdout, stderr)
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	return d.Copy(ctx, db, rows, table)
+}
+
+// CopyWithInsert builds a copy handler based on insert.
+func CopyWithInsert(placeholder func(int) string) func(ctx context.Context, db *sql.DB, rows *sql.Rows, table string) (int64, error) {
+	if placeholder == nil {
+		placeholder = func(n int) string { return fmt.Sprintf("$%d", n) }
+	}
+	return func(ctx context.Context, db *sql.DB, rows *sql.Rows, table string) (int64, error) {
+		columns, err := rows.Columns()
+		if err != nil {
+			return 0, fmt.Errorf("failed to fetch source rows columns: %w", err)
+		}
+		clen := len(columns)
+		query := table
+		if !strings.HasPrefix(strings.ToLower(query), "insert into") {
+			leftParen := strings.IndexRune(table, '(')
+			if leftParen == -1 {
+				colStmt, err := db.PrepareContext(ctx, "SELECT * FROM "+table+" WHERE 1=0")
+				if err != nil {
+					return 0, fmt.Errorf("failed to prepare query to determine target table columns: %w", err)
+				}
+				defer colStmt.Close()
+				colRows, err := colStmt.QueryContext(ctx)
+				if err != nil {
+					return 0, fmt.Errorf("failed to execute query to determine target table columns: %w", err)
+				}
+				columns, err := colRows.Columns()
+				if err != nil {
+					return 0, fmt.Errorf("failed to fetch target table columns: %w", err)
+				}
+				table += "(" + strings.Join(columns, ", ") + ")"
+			}
+			// TODO if the db supports multiple rows per insert, create batches of 100 rows
+			placeholders := make([]string, clen)
+			for i := 0; i < clen; i++ {
+				placeholders[i] = placeholder(i + 1)
+			}
+			query = "INSERT INTO " + table + " VALUES (" + strings.Join(placeholders, ", ") + ")"
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return 0, fmt.Errorf("failed to begin transaction: %w", err)
+		}
+		stmt, err := tx.PrepareContext(ctx, query)
+		if err != nil {
+			return 0, fmt.Errorf("failed to prepare insert query: %w", err)
+		}
+		defer stmt.Close()
+		values := make([]interface{}, clen)
+		for i := 0; i < clen; i++ {
+			values[i] = new(interface{})
+		}
+		var n int64
+		for rows.Next() {
+			err = rows.Scan(values...)
+			if err != nil {
+				return n, fmt.Errorf("failed to scan row: %w", err)
+			}
+			res, err := stmt.ExecContext(ctx, values...)
+			if err != nil {
+				return n, fmt.Errorf("failed to exec insert: %w", err)
+			}
+			rn, err := res.RowsAffected()
+			if err != nil {
+				return n, fmt.Errorf("failed to check rows affected: %w", err)
+			}
+			n += rn
+		}
+		// TODO if using batches, flush the last batch,
+		// TODO prepare another statement and count remaining rows
+		err = tx.Commit()
+		if err != nil {
+			return n, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return n, rows.Err()
+	}
 }
